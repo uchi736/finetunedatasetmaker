@@ -1,0 +1,21 @@
+﻿# PDF処理 (scripts/extract/datasetmaker.py)
+PyMuPDF>=1.24.0
+pymupdf4llm>=0.0.10
+python-dotenv>=1.0.0
+langchain-core>=0.1.0
+langchain-text-splitters>=0.0.1
+tqdm>=4.66.0
+pandas>=2.0.0
+datasketch>=1.6.0
+transformers>=4.36.0
+torch>=2.0.0
+nltk>=3.8.0
+Pillow>=10.0.0
+
+# Azure Document Intelligence (オプション: --use-azure-di)
+azure-ai-documentintelligence>=1.0.0
+
+# データ拡張 (scripts/augment/expand_*.py)
+pydantic-ai>=0.0.14
+pydantic>=2.0.0
+openai>=1.0.0

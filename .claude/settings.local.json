@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(dir:*)",
+      "Bash(move datasetdatasetmaker.py scriptsextract )",
+      "Bash(move expand_elaboration.py scriptsaugment )",
+      "Bash(move expand_generalized.py scriptsaugment )",
+      "Bash(move expand_keywords.py scriptsaugment )",
+      "Bash(move expand_qa_difficult.py scriptsaugment )",
+      "Bash(move expand_to_english.py scriptsaugment)",
+      "Bash(move \"c:\\work\\finetune\\azure_di_processor.py\" \"c:\\work\\finetune\\scripts\\preprocess\"\")",
+      "Bash(Remove-Item \"c:\\work\\finetune\\scripts\\preprocess\\clean_jsonl.py\" -Force)",
+      "Bash(Move-Item \"c:\\work\\finetune\\azure_di_processor.py\" \"c:\\work\\finetune\\scripts\\preprocess\"\")",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

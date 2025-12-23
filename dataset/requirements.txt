@@ -1,0 +1,15 @@
+﻿pymupdf
+pymupdf4llm
+python-dotenv
+langchain
+tqdm
+pandas
+google-generativeai
+Pillow
+tabulate
+datasketch
+transformers
+torch
+nltk
+sentencepiece
+accelerate

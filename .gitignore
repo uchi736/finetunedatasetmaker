@@ -1,0 +1,33 @@
+# 環境変数
+.env
+config/.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+.venv/
+myenv/
+
+# 抽出画像
+extracted_images/
+
+# データファイル
+data/input/*.pdf
+data/output/*.jsonl
+data/dict/*.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ログ
+*.log
