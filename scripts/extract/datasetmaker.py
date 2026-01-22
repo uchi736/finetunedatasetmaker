@@ -34,6 +34,19 @@ import torch
 import nltk
 from nltk.tokenize import sent_tokenize
 
+# テキストクリーニング
+try:
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from preprocess.clean_text import TextCleaner
+    TEXT_CLEANER_AVAILABLE = True
+except ImportError:
+    TEXT_CLEANER_AVAILABLE = False
+    TextCleaner = None
+
+# プロンプト定義
+from prompts import get_user_prompt, get_specialized_qa_prompt, SPECIALIZED_QA_TYPES
+
 # NLTKのpunktデータセットをダウンロード（初回のみ）
 try:
     nltk.data.find('tokenizers/punkt')
@@ -185,15 +198,23 @@ class AdvancedPDFProcessor:
         extract_tables: bool = True,
         extract_images: bool = True,
         use_azure_di: bool = False,
+        clean_level: str = "basic",  # off, basic, aggressive
     ):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.extract_tables = extract_tables
         self.extract_images = extract_images
         self.use_azure_di = use_azure_di
+        self.clean_level = clean_level
 
         self.layout_analyzer = LayoutAnalyzer()
         self._setup_vision_model()
+
+        # テキストクリーナーの設定
+        self.text_cleaner = None
+        if TEXT_CLEANER_AVAILABLE and clean_level != "off":
+            self.text_cleaner = TextCleaner(level=clean_level)
+            logger.info(f"TextCleaner initialized with level: {clean_level}")
 
         # Azure Document Intelligence の設定
         self.di_client = None
@@ -264,7 +285,14 @@ class AdvancedPDFProcessor:
             # 4. 日本語テキストのクリーンアップ
             markdown_text = clean_japanese_text(markdown_text)
 
-            # 5. チャンク分割
+            # 5. 高度なテキストクリーニング（ページ番号、ヘッダ/フッタ、目次除去など）
+            if self.text_cleaner:
+                clean_result = self.text_cleaner.clean(markdown_text)
+                markdown_text = clean_result.text
+                if clean_result.stats:
+                    logger.info(f"TextCleaner: {clean_result.stats.get('reduction_rate', 0):.1%} reduction")
+
+            # 6. チャンク分割
             chunks = self._create_chunks(markdown_text, pdf_path.name)
 
             return chunks
@@ -511,15 +539,7 @@ class AdvancedPDFProcessor:
             ext = img_path.suffix.lower()
             mime_type = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif"}.get(ext, "image/png")
 
-            prompt = """この画像を分析してください。
-もし画像が主に枠で囲まれたテキストである場合、"TEXT_ONLY:"という接頭辞に続けて、画像内のテキストを全て書き起こしてください。
-それ以外の場合は、この画像の内容を統合報告書に掲載するキャプションとして、以下の形式で簡潔に日本語で説明してください。
-
-- **種類**: 画像の種類を特定します（例: 製品写真, ウェブサイトのスクリーンショット, ロゴ, グラフ, 表）。
-- **内容**: 画像に写っている主要な要素や情報を客観的に記述します。
-- **示唆**: (任意) この画像がビジネスや経営において持つ可能性のある意味や示唆を簡潔に述べます。
-
-説明は客観的かつ簡潔にまとめてください。"""
+            prompt = get_user_prompt("image_description")
 
             response = self.vision_client.chat.completions.create(
                 model="gpt-4.1-mini",
@@ -581,46 +601,87 @@ class AdvancedPDFProcessor:
         return text.strip()
     
     def _create_chunks(self, markdown_text: str, source_file: str) -> List[ChunkData]:
-        """Markdownテキストをヘッダーに基づいてチャンク分割し、階層的なメタデータを付与"""
-        
-        headers_to_split_on = [
-            ("#", "H1"),
-            ("##", "H2"),
-            ("###", "H3"),
-            ("####", "H4"),
+        """Markdownテキストを階層的に分割（章→節→項→目の順で必要な場合のみ細分化）"""
+
+        # ヘッダーレベル定義（上位から順に）
+        header_levels = [
+            ("#", "H1"),    # 章
+            ("##", "H2"),   # 節
+            ("###", "H3"),  # 項
+            ("####", "H4"), # 目
         ]
 
-        # 1. Markdownヘッダーで大まかに分割
-        md_header_splitter = MarkdownHeaderTextSplitter(
-            headers_to_split_on=headers_to_split_on, strip_headers=False
-        )
-        md_docs = md_header_splitter.split_text(markdown_text)
+        # 階層的に分割
+        chunks_text = [markdown_text]
+        current_metadata = [{}]  # 各チャンクのメタデータを追跡
 
-        # 2. 各ヘッダーセクションをさらにサイズで分割
+        for header_marker, header_name in header_levels:
+            new_chunks = []
+            new_metadata = []
+
+            for chunk, meta in zip(chunks_text, current_metadata):
+                if len(chunk) <= self.chunk_size:
+                    # サイズ内なら分割不要
+                    new_chunks.append(chunk)
+                    new_metadata.append(meta)
+                else:
+                    # このレベルのヘッダーで分割
+                    splitter = MarkdownHeaderTextSplitter(
+                        headers_to_split_on=[(header_marker, header_name)],
+                        strip_headers=False
+                    )
+                    split_docs = splitter.split_text(chunk)
+
+                    if len(split_docs) <= 1:
+                        # 分割できなかった場合はそのまま
+                        new_chunks.append(chunk)
+                        new_metadata.append(meta)
+                    else:
+                        for doc in split_docs:
+                            new_chunks.append(doc.page_content)
+                            # メタデータをマージ
+                            merged_meta = {**meta, **doc.metadata}
+                            new_metadata.append(merged_meta)
+
+            chunks_text = new_chunks
+            current_metadata = new_metadata
+
+        # 最終手段: まだ大きいものはRecursiveCharacterTextSplitterで分割
+        final_chunks = []
+        final_metadata = []
+
         size_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
         )
-        split_docs = size_splitter.split_documents(md_docs)
 
-        # 3. 最終的なChunkDataリストを作成
+        for chunk, meta in zip(chunks_text, current_metadata):
+            if len(chunk) <= self.chunk_size:
+                final_chunks.append(chunk)
+                final_metadata.append(meta)
+            else:
+                # 段落単位で分割
+                split_texts = size_splitter.split_text(chunk)
+                for text in split_texts:
+                    final_chunks.append(text)
+                    final_metadata.append(meta.copy())
+
+        # ChunkDataリストを作成
         chunks = []
-        for i, doc in enumerate(split_docs):
-            chunk_text = doc.page_content.strip()
+        for i, (chunk_text, meta) in enumerate(zip(final_chunks, final_metadata)):
+            chunk_text = chunk_text.strip()
             if not chunk_text:
                 continue
 
-            # メタデータからセクションパスを構築
+            # セクションパスを構築
             headers = []
-            if "H1" in doc.metadata: headers.append(doc.metadata["H1"])
-            if "H2" in doc.metadata: headers.append(doc.metadata["H2"])
-            if "H3" in doc.metadata: headers.append(doc.metadata["H3"])
-            if "H4" in doc.metadata: headers.append(doc.metadata["H4"])
+            for h in ["H1", "H2", "H3", "H4"]:
+                if h in meta:
+                    headers.append(meta[h])
             section_path = ' › '.join(headers)
 
-            # ページ番号の抽出
             page_numbers = self._extract_page_numbers(chunk_text)
-            
+
             chunk = ChunkData(
                 id=f"{Path(source_file).stem}_c{i+1}",
                 text=chunk_text,
@@ -634,7 +695,7 @@ class AdvancedPDFProcessor:
                 }
             )
             chunks.append(chunk)
-            
+
         logger.info(f"Created {len(chunks)} chunks from {source_file}")
         return chunks
     
@@ -697,7 +758,7 @@ class DataAugmenter:
         """言い換え生成"""
         if not self.client or not text.strip():
             return ""
-        prompt = f"以下の文章を、元の意味を完全に保持したまま、異なる表現で言い換えてください。言い換えた後の文章のみを出力してください。\n\n# 元の文章:\n{text}"
+        prompt = get_user_prompt("paraphrase", text=text)
         try:
             return self._call_llm(prompt)
         except Exception as e:
@@ -708,14 +769,7 @@ class DataAugmenter:
         """QAペア生成"""
         if not self.client or not context.strip():
             return {}
-        prompt = f"""以下の文章に基づいて、質の高い質問と回答を1ペア生成してください。
-出力は以下のJSON形式で:
-```json
-{{"question": "質問", "answer": "回答"}}
-```
-
-# 文章:
-{context}"""
+        prompt = get_user_prompt("qa", context=context)
         try:
             response_text = self._call_llm(prompt)
             json_match = re.search(r'```json\s*({.*?})\s*```', response_text, re.DOTALL)
@@ -730,7 +784,7 @@ class DataAugmenter:
         """要約生成"""
         if not self.client or not text.strip():
             return ""
-        prompt = f"以下の文章を{max_length}文字程度で簡潔に要約してください。\n\n# 文章:\n{text}"
+        prompt = get_user_prompt("summary", text=text, max_length=max_length)
         try:
             return self._call_llm(prompt)
         except Exception as e:
@@ -741,14 +795,7 @@ class DataAugmenter:
         """キーワード抽出"""
         if not self.client or not text.strip():
             return []
-        prompt = f"""以下の文章から重要なキーワードを5つ抽出し、説明を付けてください。
-出力は以下のJSON形式で:
-```json
-[{{"keyword": "キーワード", "description": "説明"}}]
-```
-
-# 文章:
-{text}"""
+        prompt = get_user_prompt("keywords", text=text)
         try:
             response_text = self._call_llm(prompt)
             json_match = re.search(r'```json\s*(\[.*?\])\s*```', response_text, re.DOTALL)
@@ -763,7 +810,7 @@ class DataAugmenter:
         """詳細化テキスト生成"""
         if not self.client or not text.strip():
             return ""
-        prompt = f"以下の文章を、具体例や背景情報を補足しながらより詳細に説明してください。\n\n# 元の文章:\n{text}"
+        prompt = get_user_prompt("elaboration", text=text)
         try:
             return self._call_llm(prompt)
         except Exception as e:
@@ -774,7 +821,7 @@ class DataAugmenter:
         """翻訳"""
         if not self.client or not text.strip():
             return ""
-        prompt = f"以下の日本語の文章を自然な{lang}に翻訳してください。翻訳後の文章のみを出力。\n\n# 元の文章:\n{text}"
+        prompt = get_user_prompt("translation", text=text, lang=lang)
         try:
             return self._call_llm(prompt)
         except Exception as e:
@@ -785,12 +832,7 @@ class DataAugmenter:
         """特定観点のQA生成"""
         if not self.client or not context.strip():
             return {}
-        type_desc = {"methods": "手法・技術", "people": "人物名・組織名", "numbers": "数値・統計データ"}
-        prompt = f"""以下の文章から「{type_desc.get(qa_type, '一般')}」に焦点を当てたQAを1ペア生成。
-出力はJSON形式: {{"question": "質問", "answer": "回答"}}
-
-# 文章:
-{context}"""
+        prompt = get_specialized_qa_prompt(context=context, qa_type=qa_type)
         try:
             response_text = self._call_llm(prompt)
             json_match = re.search(r'\{.*?\}', response_text, re.DOTALL)
@@ -805,11 +847,7 @@ class DataAugmenter:
         """議論形式の対話生成"""
         if not self.client or not text.strip():
             return ""
-        prompt = f"""以下の文章について専門家同士の議論を{turns}往復で生成してください。
-形式: 質問者: (内容) / 回答者: (内容)
-
-# 元の文章:
-{text}"""
+        prompt = get_user_prompt("discussion", text=text, turns=turns)
         try:
             return self._call_llm(prompt)
         except Exception as e:

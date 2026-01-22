@@ -6,12 +6,17 @@ PydanticAIを使用してJSON形式を保証
 import json
 import asyncio
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from openai import AzureOpenAI
 from dotenv import load_dotenv
+
+# プロンプト定義のインポート
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from prompts import get_system_prompt
 
 # .envファイルを読み込み
 load_dotenv('config/.env')
@@ -29,14 +34,7 @@ os.environ['AZURE_OPENAI_API_KEY'] = os.getenv('AZURE_OPENAI_API_KEY')
 agent = Agent(
     "azure:gpt-4.1-mini",
     output_type=TranslatedText,
-    system_prompt="""You are a professional translator.
-Translate the given Japanese text to English accurately while preserving:
-- Technical terminology
-- Document structure (markdown, HTML tags, etc.)
-- Numbers and data
-- Formatting and line breaks
-
-Provide natural, fluent English translation.""",
+    system_prompt=get_system_prompt("english_translation"),
 )
 
 
@@ -48,6 +46,53 @@ async def translate_text(text: str) -> str:
     except Exception as e:
         print(f"翻訳エラー: {e}")
         return text  # エラー時は元のテキストを返す
+
+
+async def process(data: list, batch_size: int = 10) -> list:
+    """
+    パイプライン用: データリストを英語に翻訳して返す
+
+    Args:
+        data: [{"text": str, ...}, ...]
+        batch_size: 並行処理のバッチサイズ
+
+    Returns:
+        list: [{"text": str, "source": "english"}, ...]
+    """
+    results = []
+    batch = []
+
+    for item in data:
+        if "text" not in item:
+            continue
+
+        batch.append(item["text"])
+
+        # バッチサイズに達したら処理
+        if len(batch) >= batch_size:
+            tasks = [translate_text(text) for text in batch]
+            translated_texts = await asyncio.gather(*tasks)
+
+            for translated in translated_texts:
+                results.append({
+                    "text": translated,
+                    "source": "english"
+                })
+
+            batch = []
+
+    # 残りのバッチを処理
+    if batch:
+        tasks = [translate_text(text) for text in batch]
+        translated_texts = await asyncio.gather(*tasks)
+
+        for translated in translated_texts:
+            results.append({
+                "text": translated,
+                "source": "english"
+            })
+
+    return results
 
 
 async def process_jsonl_file(

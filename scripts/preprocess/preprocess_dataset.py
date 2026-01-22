@@ -2,10 +2,16 @@
 # このスクリプトはCPUのみで実行可能です
 
 import os
+import sys
+from pathlib import Path
 from datasets import load_dataset
 from transformers import AutoTokenizer
 import warnings
 from multiprocess import freeze_support
+
+# プロンプト定義のインポート
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from prompts import get_system_prompt
 
 warnings.filterwarnings("ignore")
 
@@ -16,8 +22,8 @@ output_dir = "./preprocessed_dolly_ja"
 # ========= フォーマット関数 =========
 def format_llama3_style(example):
     """Llama-3形式でフォーマット"""
-    system_prompt = "あなたは誠実で有能な日本語のAIアシスタントです。ユーザーの質問に対して、正確で役立つ回答を提供してください。"
-    
+    system_prompt = get_system_prompt("llama3_assistant")
+
     instruction = example['instruction']
     input_context = example['input'] if 'input' in example and example['input'] else ""
     output = example['output']

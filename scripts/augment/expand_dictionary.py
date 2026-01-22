@@ -91,6 +91,27 @@ A: {definition}"""
     return texts
 
 
+def process(dict_file: str, format_type: str = "all") -> list:
+    """
+    パイプライン用: 辞書から学習データを生成して返す
+
+    Args:
+        dict_file: 専門用語辞書JSONファイル
+        format_type: 出力形式 ("all", "definition", "simple", "qa")
+
+    Returns:
+        list: [{"text": str, "source": "dictionary"}, ...]
+    """
+    entries = extract_dictionary_entries(dict_file)
+    texts = generate_training_texts(entries, format_type)
+
+    # sourceを追加
+    for item in texts:
+        item["source"] = "dictionary"
+
+    return texts
+
+
 def process_dictionary(
     dict_file: str,
     output_file: str,

@@ -6,11 +6,16 @@
 import json
 import asyncio
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from dotenv import load_dotenv
+
+# プロンプト定義のインポート
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from prompts import get_system_prompt, get_user_prompt
 
 # .envファイルを読み込み
 load_dotenv('config/.env')
@@ -34,22 +39,7 @@ os.environ['AZURE_OPENAI_API_KEY'] = os.getenv('AZURE_OPENAI_API_KEY')
 agent = Agent(
     "azure:gpt-4.1-mini",
     output_type=QAOutput,
-    system_prompt="""あなたは専門的なQ&Aを生成する専門家です。
-
-与えられたテキストと専門用語辞書の情報を基に、専門知識が必要な難しい質問と回答のペアを生成してください。
-
-ルール:
-- テキストの内容と辞書の専門用語情報を組み合わせて質問を作成する
-- 質問は専門用語や業界知識を理解していないと答えられないレベルにする
-- 回答は辞書の定義とテキストの内容を基に、詳細かつ正確に記述する
-- 3〜5個のQ&Aペアを生成する
-
-質問の種類の例:
-- 専門用語の意味を問う質問（「〜とは何ですか」）
-- 概念間の関係を問う質問（「〜と〜の関係は」）
-- 技術的な仕組みを問う質問（「〜はどのように機能しますか」）
-- 応用や実例を問う質問（「〜はどのような場面で使われますか」）
-""",
+    system_prompt=get_system_prompt("qa_difficult"),
 )
 
 
@@ -107,14 +97,7 @@ async def generate_qa(text: str, terms: list[dict]) -> list[dict]:
         for t in terms[:10]  # 最大10用語
     ])
 
-    prompt = f"""以下のテキストと専門用語情報を基に、専門的なQ&Aを生成してください。
-
-【テキスト】
-{text[:2000]}
-
-【関連する専門用語】
-{terms_info}
-"""
+    prompt = get_user_prompt("qa_difficult", text=text[:2000], terms_info=terms_info)
 
     try:
         result = await agent.run(prompt)
@@ -128,6 +111,68 @@ async def generate_qa(text: str, terms: list[dict]) -> list[dict]:
     except Exception as e:
         print(f"QA生成エラー: {e}")
         return []
+
+
+async def process(data: list, dict_file: str, batch_size: int = 5) -> list:
+    """
+    パイプライン用: データリストからQ&Aを生成して返す
+
+    Args:
+        data: [{"text": str, ...}, ...]
+        dict_file: 専門用語辞書JSONファイル
+        batch_size: 並行処理のバッチサイズ
+
+    Returns:
+        list: [{"text": str, "source": "qa"}, ...]
+    """
+    term_dict, _ = load_dictionary(dict_file)
+    results = []
+
+    # バッチ処理用のデータを準備
+    batch_texts = []
+    batch_terms = []
+
+    for item in data:
+        if "text" not in item:
+            continue
+
+        text = item["text"]
+        found_terms = find_terms_in_text(text, term_dict)
+
+        if found_terms:
+            batch_texts.append(text)
+            batch_terms.append(found_terms)
+
+        # バッチサイズに達したら処理
+        if len(batch_texts) >= batch_size:
+            tasks = [generate_qa(text, terms) for text, terms in zip(batch_texts, batch_terms)]
+            batch_results = await asyncio.gather(*tasks)
+
+            for qa_pairs in batch_results:
+                for qa in qa_pairs:
+                    qa_text = f"質問: {qa['question']}\n\n回答: {qa['answer']}"
+                    results.append({
+                        "text": qa_text,
+                        "source": "qa"
+                    })
+
+            batch_texts = []
+            batch_terms = []
+
+    # 残りのバッチを処理
+    if batch_texts:
+        tasks = [generate_qa(text, terms) for text, terms in zip(batch_texts, batch_terms)]
+        batch_results = await asyncio.gather(*tasks)
+
+        for qa_pairs in batch_results:
+            for qa in qa_pairs:
+                qa_text = f"質問: {qa['question']}\n\n回答: {qa['answer']}"
+                results.append({
+                    "text": qa_text,
+                    "source": "qa"
+                })
+
+    return results
 
 
 async def process_jsonl_file(

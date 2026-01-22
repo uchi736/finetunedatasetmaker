@@ -78,6 +78,33 @@ def generalize_text(text: str, term_dict: dict) -> dict:
     }
 
 
+def process(data: list, dict_file: str) -> list:
+    """
+    パイプライン用: データリストの専門用語を一般化して返す
+
+    Args:
+        data: [{"text": str, ...}, ...]
+        dict_file: 専門用語辞書JSONファイル
+
+    Returns:
+        list: [{"text": str, "source": "generalized"}, ...]
+    """
+    term_dict = load_dictionary(dict_file)
+    results = []
+
+    for item in data:
+        if "text" not in item:
+            continue
+
+        result = generalize_text(item["text"], term_dict)
+        results.append({
+            "text": result["text"],
+            "source": "generalized"
+        })
+
+    return results
+
+
 def process_jsonl_file(
     input_file: str,
     output_file: str,

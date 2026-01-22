@@ -101,6 +101,37 @@ def generate_keywords_text(keywords: list[dict]) -> str:
     return "\n".join(parts)
 
 
+def process(data: list, dict_file: str) -> list:
+    """
+    パイプライン用: データリストからキーワードを抽出して返す
+
+    Args:
+        data: [{"text": str, ...}, ...]
+        dict_file: 専門用語辞書JSONファイル
+
+    Returns:
+        list: [{"text": str, "source": "keywords"}, ...]
+    """
+    term_dict = load_dictionary(dict_file)
+    results = []
+
+    for item in data:
+        if "text" not in item:
+            continue
+
+        result = extract_keywords(item["text"], term_dict)
+        keywords = result["keywords"]
+
+        if keywords:
+            keywords_text = generate_keywords_text(keywords)
+            results.append({
+                "text": keywords_text,
+                "source": "keywords"
+            })
+
+    return results
+
+
 def process_jsonl_file(
     input_file: str,
     output_file: str,
