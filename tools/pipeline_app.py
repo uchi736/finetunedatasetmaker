@@ -8,6 +8,7 @@ import streamlit as st
 import subprocess
 import json
 import os
+import sys
 from pathlib import Path
 
 # ページ設定
@@ -101,31 +102,59 @@ with tab1:
 
     st.divider()
 
+    # 入力モード選択（フォーム外 - モード切替時のみ再描画）
+    input_mode = st.radio(
+        "入力モード",
+        ["📁 PDFフォルダ", "📄 JSONLファイル"],
+        horizontal=True,
+        help="PDFから新規作成 or 既存JSONLを拡張",
+        key="input_mode_radio"
+    )
+
+    # JSONLファイルリストを事前取得（フォーム外で実行）
+    jsonl_search_dirs = ["data/output", "data", "."]
+    jsonl_files = []
+    for search_dir in jsonl_search_dirs:
+        if Path(search_dir).exists():
+            jsonl_files.extend(Path(search_dir).glob("*.jsonl"))
+            jsonl_files.extend(Path(search_dir).glob("**/*.jsonl"))
+    jsonl_files = sorted(set(str(f) for f in jsonl_files))
+
+    # モード判定（フォーム内外で使用）
+    is_pdf_mode = "PDF" in input_mode
+
+    # 設定セクション（フォームなし - 条件分岐の問題を回避）
     # 入出力設定
     with st.expander("📂 入出力設定", expanded=True):
-        input_mode = st.radio(
-            "入力モード",
-            ["📁 PDFフォルダ", "📄 JSONLファイル"],
-            horizontal=True,
-            help="PDFから新規作成 or 既存JSONLを拡張"
-        )
-
         col1, col2 = st.columns(2)
         with col1:
-            if "PDF" in input_mode:
-                input_path = st.text_input(
-                    "入力フォルダ",
-                    value=input_dir_default,
-                    key="batch_input",
-                    help="PDFファイルが格納されているフォルダ"
+            # PDFモード用入力
+            input_path_pdf = st.text_input(
+                "入力フォルダ (PDF)",
+                value=input_dir_default,
+                key="batch_input",
+                help="PDFファイルが格納されているフォルダ",
+                disabled=not is_pdf_mode
+            )
+            # JSONLモード用入力
+            if jsonl_files:
+                input_path_jsonl = st.selectbox(
+                    "入力JSONLファイル",
+                    options=[""] + jsonl_files,
+                    key="batch_input_jsonl",
+                    help="拡張したいJSONLファイルを選択",
+                    disabled=is_pdf_mode
                 )
             else:
-                input_path = st.text_input(
+                input_path_jsonl = st.text_input(
                     "入力JSONLファイル",
                     value="data/output/preprocessed.jsonl",
-                    key="batch_input_jsonl",
-                    help="拡張したいJSONLファイル"
+                    key="batch_input_jsonl_manual",
+                    help="拡張したいJSONLファイルのパス",
+                    disabled=is_pdf_mode
                 )
+            # 実際に使用するパスを決定
+            input_path = input_path_pdf if is_pdf_mode else input_path_jsonl
         with col2:
             output_file = st.text_input(
                 "出力ファイル",
@@ -134,39 +163,67 @@ with tab1:
                 help="生成されるJSONLファイルのパス"
             )
 
-    # PDF処理設定（PDFモードのみ）
-    if "PDF" in input_mode:
-        with st.expander("🔧 PDF処理設定", expanded=False):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                chunk_size = st.number_input(
-                    "チャンクサイズ",
-                    value=1500,
-                    min_value=100,
-                    max_value=10000,
-                    step=100,
-                    help="テキストを分割する際の最大文字数"
-                )
-            with col2:
-                chunk_overlap = st.number_input(
-                    "オーバーラップ",
-                    value=100,
-                    min_value=0,
-                    max_value=500,
-                    step=10,
-                    help="チャンク間の重複文字数"
-                )
-            with col3:
-                use_azure_di = st.checkbox(
-                    "Azure DI 使用",
-                    value=False,
-                    help="Azure Document Intelligenceで高精度抽出"
-                )
-    else:
-        # JSONLモードではデフォルト値を使用
-        chunk_size = 1500
-        chunk_overlap = 100
-        use_azure_di = False
+    # PDF処理設定（常に表示、JSONLモード時は無効）
+    with st.expander("🔧 PDF処理設定", expanded=False):
+        if not is_pdf_mode:
+            st.caption("💡 PDFモード選択時に有効になります")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            chunk_size = st.number_input(
+                "チャンクサイズ",
+                value=1500,
+                min_value=100,
+                max_value=10000,
+                step=100,
+                help="テキストを分割する際の最大文字数",
+                disabled=not is_pdf_mode
+            )
+        with col2:
+            chunk_overlap = st.number_input(
+                "オーバーラップ",
+                value=100,
+                min_value=0,
+                max_value=500,
+                step=10,
+                help="チャンク間の重複文字数",
+                disabled=not is_pdf_mode
+            )
+        with col3:
+            use_azure_di = st.checkbox(
+                "Azure DI 使用",
+                value=False,
+                help="Azure Document Intelligenceで高精度抽出",
+                disabled=not is_pdf_mode
+            )
+
+    # Azure DI詳細オプション（常に表示）
+    with st.expander("🔍 Azure DI 詳細オプション", expanded=False):
+        if not is_pdf_mode:
+            st.caption("💡 PDFモード + Azure DI使用時に有効になります")
+        elif not use_azure_di:
+            st.caption("💡 Azure DI使用にチェックを入れると有効になります")
+        di_col1, di_col2, di_col3 = st.columns(3)
+        with di_col1:
+            extract_figures = st.checkbox(
+                "図をテキスト化",
+                value=True,
+                help="Vision API で図を説明文に変換",
+                disabled=not (is_pdf_mode and use_azure_di)
+            )
+        with di_col2:
+            convert_tables = st.checkbox(
+                "表をテキスト化",
+                value=True,
+                help="HTML表をLLMで文章に変換",
+                disabled=not (is_pdf_mode and use_azure_di)
+            )
+        with di_col3:
+            save_markdown = st.checkbox(
+                "Markdownを保存",
+                value=True,
+                help="output/markdown/ に保存",
+                disabled=not (is_pdf_mode and use_azure_di)
+            )
 
     # テキストクリーニング設定
     with st.expander("🧹 テキストクリーニング", expanded=False):
@@ -295,14 +352,97 @@ with tab1:
         else:
             tokenizer_name = None
 
+    # 設定確定ボタン（通常のボタン）
+    submitted = st.button("⚙️ 設定を確定", type="secondary", use_container_width=True)
+
     st.divider()
 
+    # コマンド生成（設定確定後のみ表示）
+    # session_stateで設定を保持
+    if submitted:
+        st.session_state["settings_confirmed"] = True
+        st.session_state["cfg"] = {
+            "input_mode": input_mode,
+            "input_path": input_path,
+            "output_file": output_file,
+            "chunk_size": chunk_size if "PDF" in input_mode else 1500,
+            "chunk_overlap": chunk_overlap if "PDF" in input_mode else 100,
+            "use_azure_di": use_azure_di if "PDF" in input_mode else False,
+            "extract_figures": extract_figures if "PDF" in input_mode and use_azure_di else False,
+            "convert_tables": convert_tables if "PDF" in input_mode and use_azure_di else False,
+            "save_markdown": save_markdown if "PDF" in input_mode and use_azure_di else False,
+            "clean_level": clean_level,
+            "augment": augment,
+            "aug_paraphrase": aug_paraphrase if augment else False,
+            "aug_qa": aug_qa if augment else False,
+            "aug_summary": aug_summary if augment else False,
+            "aug_keywords": aug_keywords if augment else False,
+            "aug_discussion": aug_discussion if augment else False,
+            "aug_en": aug_en if augment else False,
+            "aug_zh": aug_zh if augment else False,
+            "aug_dictionary": aug_dictionary if augment else False,
+            "aug_generalized": aug_generalized if augment else False,
+            "aug_graph": aug_graph if augment else False,
+            "dict_file": dict_file if augment else "data/dict/terms.json",
+            "graph_file": graph_file if augment else "data/graph/graph.json",
+            "pack": pack,
+            "max_seq_len": max_seq_len,
+            "no_shuffle": no_shuffle,
+            "keep_intermediate": keep_intermediate,
+            "tokenizer_name": tokenizer_name,
+        }
+        st.rerun()
+
+    # 設定確定済みの場合のみコマンド表示
+    if not st.session_state.get("settings_confirmed"):
+        st.info("👆 設定を選択して「設定を確定」ボタンを押してください")
+        st.stop()
+
+    # 保存された設定を使用
+    cfg = st.session_state.get("cfg", {})
+    input_mode = cfg.get("input_mode", input_mode)
+    input_path = cfg.get("input_path", input_path if "input_path" in dir() else "data/input")
+    output_file = cfg.get("output_file", output_file if "output_file" in dir() else "data/output/train.jsonl")
+    chunk_size = cfg.get("chunk_size", 1500)
+    chunk_overlap = cfg.get("chunk_overlap", 100)
+    use_azure_di = cfg.get("use_azure_di", False)
+    extract_figures = cfg.get("extract_figures", False)
+    convert_tables = cfg.get("convert_tables", False)
+    save_markdown = cfg.get("save_markdown", False)
+    clean_level = cfg.get("clean_level", "basic")
+    augment = cfg.get("augment", True)
+    aug_paraphrase = cfg.get("aug_paraphrase", True)
+    aug_qa = cfg.get("aug_qa", True)
+    aug_summary = cfg.get("aug_summary", False)
+    aug_keywords = cfg.get("aug_keywords", False)
+    aug_discussion = cfg.get("aug_discussion", False)
+    aug_en = cfg.get("aug_en", False)
+    aug_zh = cfg.get("aug_zh", False)
+    aug_dictionary = cfg.get("aug_dictionary", False)
+    aug_generalized = cfg.get("aug_generalized", False)
+    aug_graph = cfg.get("aug_graph", False)
+    dict_file = cfg.get("dict_file", "data/dict/terms.json")
+    graph_file = cfg.get("graph_file", "data/graph/graph.json")
+    pack = cfg.get("pack", True)
+    max_seq_len = cfg.get("max_seq_len", 2048)
+    no_shuffle = cfg.get("no_shuffle", False)
+    keep_intermediate = cfg.get("keep_intermediate", False)
+    tokenizer_name = cfg.get("tokenizer_name", None)
+
     # コマンド生成
-    cmd = ["python", "scripts/batch_pipeline.py", input_path, "-o", output_file]
-    cmd += ["--chunk-size", str(chunk_size)]
-    cmd += ["--chunk-overlap", str(chunk_overlap)]
+    cmd = [sys.executable, "scripts/batch_pipeline.py", input_path, "-o", output_file]
+    # PDFモードのみチャンクオプションを追加
+    if "PDF" in input_mode:
+        cmd += ["--chunk-size", str(chunk_size)]
+        cmd += ["--chunk-overlap", str(chunk_overlap)]
     if use_azure_di:
         cmd.append("--use-azure-di")
+        if extract_figures:
+            cmd.append("--extract-figures")
+        if convert_tables:
+            cmd.append("--convert-tables")
+        if save_markdown:
+            cmd.append("--save-markdown")
     if clean_level != "basic":  # basicはデフォルトなので省略
         cmd += ["--clean-level", clean_level]
     if augment:
@@ -345,20 +485,25 @@ with tab1:
     st.markdown("##### 🖥️ 実行コマンド")
     st.code(" ".join(cmd), language="bash")
 
-    # 実行ボタン
+    # 実行・リセットボタン
     col1, col2, col3 = st.columns([1, 1, 1])
+    with col1:
+        if st.button("🔄 設定変更", key="reset_settings", use_container_width=True):
+            st.session_state["settings_confirmed"] = False
+            st.rerun()
     with col2:
         run_button = st.button("🚀 パイプライン実行", key="run_batch", type="primary", use_container_width=True)
 
     if run_button:
         with st.status("パイプライン実行中...", expanded=True) as status:
-            st.write("📁 PDFファイルを読み込み中...")
+            input_type = "PDF" if "PDF" in input_mode else "JSONL"
+            st.write(f"📁 {input_type}ファイルを処理中...")
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
             result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
 
             if result.returncode == 0:
-                st.write("✅ PDF処理完了")
+                st.write(f"✅ {input_type}処理完了")
                 st.write("✅ パッキング完了" if pack else "✅ 変換完了")
                 st.write("✅ マージ完了")
                 status.update(label="✨ パイプライン完了!", state="complete", expanded=False)
@@ -450,7 +595,7 @@ with tab2:
             with col2:
                 pack_shuffle = st.checkbox("🔀 シャッフル", value=False, key="pack_shuf")
 
-        cmd2 = ["python", script_path, pack_input, "-o", pack_output, "--max-seq-len", str(pack_max_seq)]
+        cmd2 = [sys.executable, script_path, pack_input, "-o", pack_output, "--max-seq-len", str(pack_max_seq)]
         if pack_shuffle:
             cmd2.append("--shuffle")
 
@@ -464,7 +609,7 @@ with tab2:
 
             graph_limit = st.number_input("処理ノード数 (0=全て)", value=0, min_value=0, key="graph_limit")
 
-        cmd2 = ["python", script_path]
+        cmd2 = [sys.executable, script_path]
         if graph_input != "data/graph/graph.json":
             cmd2 += ["--input", graph_input]
         if graph_output != "data/output/graph_relations.jsonl":
@@ -473,7 +618,7 @@ with tab2:
             cmd2 += ["--limit", str(graph_limit)]
     else:
         st.caption("このスクリプトはデフォルト設定で実行されます")
-        cmd2 = ["python", script_path]
+        cmd2 = [sys.executable, script_path]
 
     # コマンドプレビュー
     st.markdown("##### 🖥️ 実行コマンド")

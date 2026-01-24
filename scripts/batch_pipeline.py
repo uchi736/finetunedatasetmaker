@@ -18,6 +18,11 @@ import sys
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
+from tqdm import tqdm
+from dotenv import load_dotenv
+
+# config/.envから環境変数を読み込み
+load_dotenv('config/.env')
 
 # scriptsディレクトリをパスに追加
 sys.path.insert(0, str(Path(__file__).parent))
@@ -34,7 +39,10 @@ def process_single_pdf(
     use_azure_di: bool,
     augment: bool,
     aug_options: dict,
-    clean_level: str = "basic"
+    clean_level: str = "basic",
+    save_markdown: bool = False,
+    extract_figures: bool = False,
+    convert_tables: bool = False
 ) -> Optional[Path]:
     """
     単一PDFを処理してJSONLを出力
@@ -54,16 +62,26 @@ def process_single_pdf(
             extract_tables=True,
             extract_images=False,  # 画像処理は時間がかかるのでデフォルトOFF
             use_azure_di=use_azure_di,
-            clean_level=clean_level
+            clean_level=clean_level,
+            extract_figures=extract_figures,
+            convert_tables=convert_tables
         )
 
         chunks = processor.process_pdf(str(pdf_path))
-
-        if not chunks:
-            print(f"  警告: チャンク抽出失敗")
-            return None
-
         print(f"  抽出チャンク数: {len(chunks)}")
+
+        # Azure DI使用時はMarkdownも保存
+        if use_azure_di and save_markdown:
+            markdown_content = processor.get_last_markdown()
+            if markdown_content:
+                md_output_dir = output_dir / "markdown"
+                md_output_dir.mkdir(parents=True, exist_ok=True)
+                md_path = md_output_dir / f"{pdf_path.stem}.md"
+                with open(md_path, 'w', encoding='utf-8') as f:
+                    f.write(f"# {pdf_path.stem}\n\n")
+                    f.write(f"*Processed with Azure Document Intelligence*\n\n---\n\n")
+                    f.write(markdown_content)
+                print(f"  Markdown出力: {md_path}")
 
         # データ拡張（オプション）
         results = []
@@ -96,7 +114,7 @@ def process_single_pdf(
             except Exception as e:
                 print(f"  ⚠️ 警告: 辞書読み込み失敗: {e}")
 
-        for chunk in chunks:
+        for chunk in tqdm(chunks, desc="  データ拡張", unit="件"):
             # オリジナル
             results.append({"text": chunk.text})
 
@@ -197,6 +215,180 @@ def process_single_pdf(
 
         # 出力
         output_path = output_dir / f"{pdf_path.stem}.jsonl"
+        with open(output_path, 'w', encoding='utf-8') as f:
+            for item in results:
+                f.write(json.dumps(item, ensure_ascii=False) + '\n')
+
+        print(f"  出力: {output_path}")
+        return output_path
+
+    except Exception as e:
+        print(f"  エラー: {e}")
+        return None
+
+
+def process_jsonl_input(
+    jsonl_path: Path,
+    output_dir: Path,
+    augment: bool,
+    aug_options: dict
+) -> Optional[Path]:
+    """
+    JSONLファイルを読み込み、データ拡張を適用して出力
+
+    Returns:
+        出力ファイルのパス（失敗時はNone）
+    """
+    print(f"\n{'='*60}")
+    print(f"処理中: {jsonl_path.name}")
+    print(f"{'='*60}")
+
+    try:
+        # JSONLを読み込み
+        texts = []
+        with open(jsonl_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    data = json.loads(line.strip())
+                    if data.get("text"):
+                        texts.append(data["text"])
+                except json.JSONDecodeError:
+                    continue
+
+        if not texts:
+            print(f"  警告: 有効なテキストがありません")
+            return None
+
+        print(f"  読み込みテキスト数: {len(texts)}")
+
+        # データ拡張（オプション）
+        results = []
+
+        # LLMベース拡張の準備
+        augmenter = None
+        llm_augment_enabled = any([
+            aug_options.get("paraphrase"),
+            aug_options.get("qa"),
+            aug_options.get("summary"),
+            aug_options.get("discussion"),
+            aug_options.get("translation_zh"),
+        ])
+        if augment and llm_augment_enabled:
+            from extract.datasetmaker import DataAugmenter
+            augmenter = DataAugmenter()
+            if not augmenter.client:
+                print("  ⚠️ 警告: Azure OpenAI クライアントが初期化されていません")
+                print("    → LLMベースの拡張はスキップされます")
+
+        # 辞書ベース拡張の準備
+        dict_file = aug_options.get("dict_file", "data/dict/terms.json")
+        term_dict = None
+        if augment and (aug_options.get("generalized") or aug_options.get("keywords")):
+            try:
+                from augment.expand_generalized import load_dictionary
+                term_dict = load_dictionary(dict_file)
+                print(f"  辞書読み込み完了: {len(term_dict)}用語")
+            except Exception as e:
+                print(f"  ⚠️ 警告: 辞書読み込み失敗: {e}")
+
+        for text in tqdm(texts, desc="  データ拡張", unit="件"):
+            # オリジナル
+            results.append({"text": text})
+
+            # LLMベース拡張
+            if augment and augmenter and augmenter.client:
+                if aug_options.get("paraphrase"):
+                    paraphrase = augmenter.generate_paraphrase(text)
+                    if paraphrase:
+                        results.append({"text": paraphrase})
+
+                if aug_options.get("qa"):
+                    qa = augmenter.generate_qa(text)
+                    if qa and qa.get("question") and qa.get("answer"):
+                        qa_text = f"質問: {qa['question']}\n回答: {qa['answer']}"
+                        results.append({"text": qa_text})
+
+                if aug_options.get("summary"):
+                    summary = augmenter.generate_summary(text)
+                    if summary:
+                        results.append({"text": summary})
+
+                if aug_options.get("discussion"):
+                    discussion = augmenter.generate_discussion(text)
+                    if discussion:
+                        results.append({"text": discussion})
+
+            # 辞書ベース拡張（LLM不要）
+            if augment and term_dict:
+                if aug_options.get("generalized"):
+                    from augment.expand_generalized import generalize_text
+                    gen_result = generalize_text(text, term_dict)
+                    if gen_result and gen_result.get("text") != text and gen_result.get("replacements"):
+                        results.append({"text": gen_result["text"]})
+
+                if aug_options.get("keywords"):
+                    from augment.expand_keywords import extract_keywords, generate_keywords_text
+                    kw_result = extract_keywords(text, term_dict)
+                    if kw_result.get("keywords"):
+                        kw_text = generate_keywords_text(kw_result["keywords"])
+                        if kw_text:
+                            results.append({"text": kw_text})
+
+        # 辞書定義（テキストとは別に辞書全体から生成）
+        if augment and aug_options.get("dictionary"):
+            try:
+                from augment.expand_dictionary import process as dict_process
+                dict_results = dict_process(dict_file)
+                for item in dict_results:
+                    results.append({"text": item["text"]})
+                print(f"  辞書定義追加: {len(dict_results)}件")
+            except Exception as e:
+                print(f"  ⚠️ 警告: 辞書定義生成失敗: {e}")
+
+        # グラフ関係性（async処理）
+        if augment and aug_options.get("graph"):
+            try:
+                import asyncio
+                from augment.expand_graph_relations import process as graph_process
+                graph_file = aug_options.get("graph_file", "data/graph/graph.json")
+                graph_results = asyncio.run(graph_process(graph_file))
+                for item in graph_results:
+                    results.append({"text": item["text"]})
+                print(f"  グラフ関係性追加: {len(graph_results)}件")
+            except Exception as e:
+                print(f"  ⚠️ 警告: グラフ関係性生成失敗: {e}")
+
+        # 英語翻訳（async処理）
+        if augment and aug_options.get("translation_en"):
+            try:
+                import asyncio
+                from augment.expand_to_english import process as translate_en
+                data = [{"text": t} for t in texts]
+                translated = asyncio.run(translate_en(data))
+                for item in translated:
+                    results.append({"text": item["text"]})
+                print(f"  英語翻訳追加: {len(translated)}件")
+            except Exception as e:
+                print(f"  ⚠️ 警告: 英語翻訳失敗: {e}")
+
+        # 中国語翻訳（LLM使用）
+        if augment and aug_options.get("translation_zh") and augmenter and augmenter.client:
+            translated_count = 0
+            for text in texts:
+                try:
+                    translated = augmenter.generate_translation(text, "中国語")
+                    if translated:
+                        results.append({"text": translated})
+                        translated_count += 1
+                except Exception as e:
+                    print(f"  ⚠️ 警告: 中国語翻訳失敗: {e}")
+            if translated_count > 0:
+                print(f"  中国語翻訳追加: {translated_count}件")
+
+        print(f"  拡張後データ数: {len(results)}")
+
+        # 出力
+        output_path = output_dir / f"{jsonl_path.stem}_augmented.jsonl"
         with open(output_path, 'w', encoding='utf-8') as f:
             for item in results:
                 f.write(json.dumps(item, ensure_ascii=False) + '\n')
@@ -322,6 +514,9 @@ def main():
     parser.add_argument("--chunk-size", type=int, default=1500, help="チャンクサイズ")
     parser.add_argument("--chunk-overlap", type=int, default=100, help="チャンクオーバーラップ")
     parser.add_argument("--use-azure-di", action="store_true", help="Azure Document Intelligenceを使用")
+    parser.add_argument("--save-markdown", action="store_true", help="Azure DI使用時に処理後のMarkdownを保存")
+    parser.add_argument("--extract-figures", action="store_true", help="Azure DI使用時に図をVision APIでテキスト化")
+    parser.add_argument("--convert-tables", action="store_true", help="HTML形式の表をLLMでテキスト化")
 
     # データ拡張オプション
     parser.add_argument("--augment", action="store_true", help="データ拡張を有効化")
@@ -382,14 +577,31 @@ def main():
     is_jsonl_input = input_path.is_file() and input_path.suffix.lower() in ['.jsonl', '.json']
 
     if is_jsonl_input:
-        # JSONL入力モード（拡張のみ）
+        # JSONL入力モード
         print(f"\n{'#'*60}")
         print(f"# バッチパイプライン開始 (JSONL入力モード)")
         print(f"# 入力ファイル: {input_path}")
         print(f"# 出力先: {output_path}")
+        print(f"# データ拡張: {'有効' if args.augment else '無効'}")
         print(f"{'#'*60}")
 
-        processed_files = [input_path]
+        if args.augment:
+            # 拡張処理を実行
+            print(f"\n[Phase 1] データ拡張")
+            result = process_jsonl_input(
+                jsonl_path=input_path,
+                output_dir=output_dir,
+                augment=True,
+                aug_options=aug_options
+            )
+            if result:
+                processed_files = [result]
+            else:
+                print("エラー: JSONL処理に失敗しました")
+                sys.exit(1)
+        else:
+            # 拡張なしの場合はそのまま使用
+            processed_files = [input_path]
     else:
         # PDFフォルダ入力モード
         input_dir = input_path
@@ -408,7 +620,7 @@ def main():
         # Phase 1: PDF処理
         print(f"\n[Phase 1] PDF処理")
         processed_files = []
-        for pdf_path in pdf_files:
+        for pdf_path in tqdm(pdf_files, desc="PDF処理進捗", unit="ファイル"):
             result = process_single_pdf(
                 pdf_path=pdf_path,
                 output_dir=output_dir,
@@ -417,7 +629,10 @@ def main():
                 use_azure_di=args.use_azure_di,
                 augment=args.augment,
                 aug_options=aug_options,
-                clean_level=args.clean_level
+                clean_level=args.clean_level,
+                save_markdown=args.save_markdown,
+                extract_figures=args.extract_figures,
+                convert_tables=args.convert_tables
             )
             if result:
                 processed_files.append(result)

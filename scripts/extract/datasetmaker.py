@@ -199,6 +199,8 @@ class AdvancedPDFProcessor:
         extract_images: bool = True,
         use_azure_di: bool = False,
         clean_level: str = "basic",  # off, basic, aggressive
+        extract_figures: bool = False,  # Azure DI使用時に図をVision APIでテキスト化
+        convert_tables: bool = False,   # HTML形式の表をLLMでテキスト化
     ):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
@@ -206,6 +208,8 @@ class AdvancedPDFProcessor:
         self.extract_images = extract_images
         self.use_azure_di = use_azure_di
         self.clean_level = clean_level
+        self.extract_figures = extract_figures
+        self.convert_tables = convert_tables
 
         self.layout_analyzer = LayoutAnalyzer()
         self._setup_vision_model()
@@ -221,18 +225,34 @@ class AdvancedPDFProcessor:
         if self.use_azure_di:
             self._setup_azure_di()
 
+        # 最後に処理したMarkdownを保持（Azure DI使用時に保存するため）
+        self._last_markdown = None
+        # 最後に処理した図情報を保持
+        self._last_figures = None
+        self._last_operation_id = None
+
     def _setup_azure_di(self):
         """Azure Document Intelligence クライアントの設定"""
         if not AZURE_DI_AVAILABLE:
-            logger.error("Azure Document Intelligence library not available.")
-            return
+            raise RuntimeError(
+                "Azure Document Intelligence ライブラリがインストールされていません。\n"
+                "→ pip install azure-ai-documentintelligence"
+            )
 
         endpoint = os.getenv('AZURE_DI_ENDPOINT')
         api_key = os.getenv('AZURE_DI_API_KEY')
 
-        if not endpoint or not api_key:
-            logger.error("AZURE_DI_ENDPOINT and AZURE_DI_API_KEY must be set in environment variables.")
-            return
+        if not endpoint:
+            raise RuntimeError(
+                "AZURE_DI_ENDPOINT が設定されていません。\n"
+                "→ config/.env に AZURE_DI_ENDPOINT=https://xxx.cognitiveservices.azure.com/ を追加"
+            )
+
+        if not api_key:
+            raise RuntimeError(
+                "AZURE_DI_API_KEY が設定されていません。\n"
+                "→ config/.env に AZURE_DI_API_KEY=xxx を追加"
+            )
 
         try:
             self.di_client = DocumentIntelligenceClient(
@@ -241,7 +261,7 @@ class AdvancedPDFProcessor:
             )
             logger.info("Azure Document Intelligence client initialized successfully.")
         except Exception as e:
-            logger.error(f"Failed to initialize Azure Document Intelligence client: {e}")
+            raise RuntimeError(f"Azure DI クライアント初期化失敗: {e}")
 
     def _setup_vision_model(self):
         """Azure OpenAI Vision APIの設定"""
@@ -272,12 +292,32 @@ class AdvancedPDFProcessor:
             else:
                 markdown_text = self._extract_structured_markdown(pdf_path)
 
+            # 抽出結果チェック
+            if not markdown_text or not markdown_text.strip():
+                raise RuntimeError(
+                    f"テキストが抽出できませんでした: {pdf_path}\n"
+                    "→ PDFが画像のみの場合は --use-azure-di オプションを使用してください"
+                )
+
+            extracted_len = len(markdown_text)
+            logger.info(f"Extracted {extracted_len} characters from {pdf_path.name}")
+
             # ヘッダーが正しく分離されるように、ヘッダーの前に空行を挿入
             markdown_text = re.sub(r'\n(#+)', r'\n\n\1', markdown_text)
 
             # 2. 画像の抽出と解説生成（pymupdfの場合のみ）
             if not self.use_azure_di and self.extract_images and self.vision_client:
                 markdown_text = self._process_images(pdf_path, markdown_text)
+
+            # 2.5. Azure DI使用時の図表処理
+            if self.use_azure_di:
+                # 図のVision API処理
+                if self.extract_figures and self._last_figures:
+                    markdown_text = self._process_azure_di_figures(markdown_text)
+
+                # HTMLテーブルのテキスト化
+                if self.convert_tables:
+                    markdown_text = self._convert_html_tables_to_text(markdown_text)
 
             # 3. Markdownのクリーンアップ
             markdown_text = self._clean_markdown(markdown_text)
@@ -286,20 +326,48 @@ class AdvancedPDFProcessor:
             markdown_text = clean_japanese_text(markdown_text)
 
             # 5. 高度なテキストクリーニング（ページ番号、ヘッダ/フッタ、目次除去など）
+            before_clean_len = len(markdown_text)
             if self.text_cleaner:
                 clean_result = self.text_cleaner.clean(markdown_text)
                 markdown_text = clean_result.text
                 if clean_result.stats:
                     logger.info(f"TextCleaner: {clean_result.stats.get('reduction_rate', 0):.1%} reduction")
 
+            # クリーニング後チェック
+            if not markdown_text or not markdown_text.strip():
+                raise RuntimeError(
+                    f"クリーニング処理で全テキストが削除されました: {pdf_path}\n"
+                    f"→ 元のテキスト: {before_clean_len}文字 → クリーニング後: 0文字\n"
+                    "→ --clean-level off で再試行してください"
+                )
+
+            # 処理後のMarkdownを保持（後で取得可能）
+            self._last_markdown = markdown_text
+
             # 6. チャンク分割
             chunks = self._create_chunks(markdown_text, pdf_path.name)
 
+            if not chunks:
+                raise RuntimeError(
+                    f"チャンク分割で0件になりました: {pdf_path}\n"
+                    f"→ テキスト長: {len(markdown_text)}文字"
+                )
+
             return chunks
 
+        except RuntimeError:
+            raise
         except Exception as e:
             logger.error(f"Error processing PDF: {e}")
-            return []
+            raise RuntimeError(f"PDF処理エラー: {pdf_path}\n→ {e}")
+
+    def get_last_markdown(self) -> Optional[str]:
+        """最後に処理したPDFのMarkdownを取得
+
+        Returns:
+            処理後のMarkdownテキスト、未処理の場合はNone
+        """
+        return self._last_markdown
 
     def _extract_with_azure_di(self, pdf_path: Path) -> str:
         """Azure Document Intelligence を使用してMarkdownを抽出"""
@@ -310,25 +378,200 @@ class AdvancedPDFProcessor:
                 file_content = f.read()
 
             # Azure Document Intelligence で解析
+            # extract_figures が有効な場合は図の画像データも取得
+            analyze_kwargs = {
+                "output_content_format": DocumentContentFormat.MARKDOWN,
+            }
+            if self.extract_figures:
+                analyze_kwargs["output"] = ["figures"]
+
             poller = self.di_client.begin_analyze_document(
                 "prebuilt-layout",
                 AnalyzeDocumentRequest(bytes_source=file_content),
-                output_content_format=DocumentContentFormat.MARKDOWN,
+                **analyze_kwargs
             )
 
             result = poller.result()
 
+            # 図情報を保存（後で処理するため）
+            self._last_figures = result.figures if hasattr(result, 'figures') else None
+            # operation_idを保存（図の画像取得に使用）
+            if self.extract_figures and hasattr(poller, 'details') and poller.details:
+                self._last_operation_id = poller.details.get('operation_id')
+            else:
+                self._last_operation_id = None
+
             if result.content:
                 logger.info(f"Azure DI extracted {len(result.content)} characters")
+                if self._last_figures:
+                    logger.info(f"Azure DI found {len(self._last_figures)} figures")
                 return result.content
             else:
-                logger.warning("Azure DI returned no content, falling back to pymupdf")
-                return self._extract_structured_markdown(pdf_path)
+                raise RuntimeError(
+                    f"Azure DI がコンテンツを返しませんでした: {pdf_path}\n"
+                    "→ PDFファイルが破損しているか、空の可能性があります"
+                )
+
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Azure DI でのPDF処理に失敗: {e}")
+
+    def _process_azure_di_figures(self, markdown_text: str) -> str:
+        """Azure DIの図をVision APIでテキスト化してMarkdownに統合"""
+        if not self._last_figures or not self.vision_client:
+            return markdown_text
+
+        logger.info(f"Processing {len(self._last_figures)} figures with Vision API")
+
+        # 図の説明を収集
+        figure_descriptions = []
+        for figure in self._last_figures:
+            try:
+                figure_id = figure.id if hasattr(figure, 'id') else None
+                if not figure_id:
+                    continue
+
+                # キャプション取得
+                caption = ""
+                if hasattr(figure, 'caption') and figure.caption:
+                    caption = figure.caption.content if hasattr(figure.caption, 'content') else str(figure.caption)
+
+                # 図の画像データを取得
+                try:
+                    figure_response = self.di_client.get_analyze_result_figure(
+                        model_id="prebuilt-layout",
+                        result_id=self._last_operation_id,
+                        figure_id=figure_id
+                    )
+                    # イテレータからバイトデータを読み取り
+                    figure_data = b"".join(figure_response)
+                    # Vision APIで分析
+                    image_base64 = base64.b64encode(figure_data).decode('utf-8')
+                    description = self._analyze_figure_with_vision(image_base64, caption)
+                    logger.info(f"Figure {figure_id} analyzed successfully")
+                except Exception as e:
+                    logger.warning(f"Failed to get figure {figure_id}: {e}")
+                    description = f"（図の取得に失敗）"
+
+                figure_descriptions.append({
+                    'id': figure_id,
+                    'caption': caption,
+                    'description': description
+                })
+
+            except Exception as e:
+                logger.warning(f"Error processing figure: {e}")
+
+        # <figure>タグを順番に置換
+        # Azure DIは<figure>...</figure>形式で図を出力
+        import re
+        figure_pattern = r'<figure[^>]*>.*?</figure>'
+        figure_matches = list(re.finditer(figure_pattern, markdown_text, re.DOTALL))
+
+        logger.info(f"Found {len(figure_matches)} <figure> tags, have {len(figure_descriptions)} descriptions")
+
+        # 後ろから置換して位置がずれないようにする
+        for i, match in enumerate(reversed(figure_matches)):
+            desc_idx = len(figure_matches) - 1 - i
+            if desc_idx < len(figure_descriptions):
+                desc = figure_descriptions[desc_idx]
+                replacement = f"\n\n【図】{desc['caption']}\n{desc['description']}\n\n"
+                markdown_text = markdown_text[:match.start()] + replacement + markdown_text[match.end():]
+                logger.info(f"Replaced <figure> tag #{desc_idx + 1} with description")
+
+        return markdown_text
+
+    def _analyze_figure_with_vision(self, image_base64: str, caption: str = "") -> str:
+        """Vision APIで図を分析してテキスト説明を生成"""
+        try:
+            prompt = f"""この図について詳細に説明してください。
+
+キャプション: {caption if caption else "なし"}
+
+以下の情報を含めてください:
+1. 図の種類（グラフ、チャート、図表、写真など）
+2. 主要な要素や構成
+3. 読み取れるデータや数値
+4. 図が示す傾向や重要なポイント
+
+簡潔かつ正確に説明してください。"""
+
+            response = self.vision_client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{image_base64}"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=1000
+            )
+
+            return response.choices[0].message.content
 
         except Exception as e:
-            logger.error(f"Azure DI extraction failed: {e}, falling back to pymupdf")
-            return self._extract_structured_markdown(pdf_path)
-    
+            logger.error(f"Vision API error: {e}")
+            return f"（図の分析に失敗しました）"
+
+    def _convert_html_tables_to_text(self, markdown_text: str) -> str:
+        """HTML形式のテーブルをLLMで自然なテキストに変換"""
+        if not self.vision_client:
+            return markdown_text
+
+        # HTML表を検出
+        html_table_pattern = r'<table[^>]*>.*?</table>'
+        matches = list(re.finditer(html_table_pattern, markdown_text, re.DOTALL | re.IGNORECASE))
+
+        if not matches:
+            return markdown_text
+
+        logger.info(f"Converting {len(matches)} HTML tables to text")
+
+        # 後ろから処理（インデックスずれ防止）
+        for match in reversed(matches):
+            html_table = match.group()
+            try:
+                text_description = self._convert_single_html_table(html_table)
+                start, end = match.span()
+                markdown_text = markdown_text[:start] + f"\n\n{text_description}\n\n" + markdown_text[end:]
+                logger.info(f"Converted HTML table ({len(html_table)} chars)")
+            except Exception as e:
+                logger.warning(f"Failed to convert HTML table: {e}")
+
+        return markdown_text
+
+    def _convert_single_html_table(self, html_table: str) -> str:
+        """単一のHTMLテーブルをテキストに変換"""
+        prompt = f"""以下のHTML表を、自然な日本語の説明文に変換してください。
+
+要件:
+- 表の内容を正確に伝える
+- 数値や項目名を省略しない
+- 行や列の関係性を明確にする
+- 箇条書きではなく、文章形式で記述する
+
+HTML表:
+{html_table}
+
+説明文:"""
+
+        response = self.vision_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1500
+        )
+
+        return response.choices[0].message.content
+
     def _extract_structured_markdown(self, pdf_path: Path) -> str:
         """構造化されたMarkdownを抽出"""
         try:

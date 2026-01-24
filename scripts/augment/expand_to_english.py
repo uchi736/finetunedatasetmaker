@@ -30,6 +30,7 @@ class TranslatedText(BaseModel):
 # Azure OpenAI環境変数を設定
 os.environ['AZURE_OPENAI_ENDPOINT'] = os.getenv('AZURE_OPENAI_ENDPOINT')
 os.environ['AZURE_OPENAI_API_KEY'] = os.getenv('AZURE_OPENAI_API_KEY')
+os.environ['OPENAI_API_VERSION'] = os.getenv('AZURE_OPENAI_API_VERSION', '2024-12-01-preview')
 
 agent = Agent(
     "azure:gpt-4.1-mini",
