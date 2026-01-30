@@ -5,11 +5,26 @@ LLM学習データセット作成パイプライン GUI
 """
 
 import streamlit as st
-import subprocess
 import json
 import os
 import sys
 from pathlib import Path
+
+
+def cmd_to_string(cmd: list) -> str:
+    """コマンドリストを読みやすい文字列に変換"""
+    if not cmd:
+        return ""
+    result = cmd[0]  # python executable
+    for i, arg in enumerate(cmd[1:], 1):
+        if arg.startswith("--"):
+            result += f" \\\n  {arg}"
+        elif arg.startswith("-") and len(arg) == 2:
+            result += f" \\\n  {arg}"
+        else:
+            result += f" {arg}"
+    return result
+
 
 # ページ設定
 st.set_page_config(
@@ -492,52 +507,18 @@ with tab1:
             st.session_state["settings_confirmed"] = False
             st.rerun()
     with col2:
-        run_button = st.button("🚀 パイプライン実行", key="run_batch", type="primary", use_container_width=True)
+        gen_button = st.button("📋 コマンド生成", key="gen_cmd", type="primary", use_container_width=True)
 
-    if run_button:
-        with st.status("パイプライン実行中...", expanded=True) as status:
-            input_type = "PDF" if "PDF" in input_mode else "JSONL"
-            st.write(f"📁 {input_type}ファイルを処理中...")
-            env = os.environ.copy()
-            env["PYTHONIOENCODING"] = "utf-8"
-            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
-
-            if result.returncode == 0:
-                st.write(f"✅ {input_type}処理完了")
-                st.write("✅ パッキング完了" if pack else "✅ 変換完了")
-                st.write("✅ マージ完了")
-                status.update(label="✨ パイプライン完了!", state="complete", expanded=False)
-                st.toast("処理が完了しました!", icon="✅")
-            else:
-                status.update(label="❌ エラー発生", state="error")
-                st.toast("エラーが発生しました", icon="❌")
-
-        # ログ表示（statusブロックの外）
-        if result.returncode == 0:
-            # 統計情報を抽出して表示
-            import re
-            stdout = result.stdout or ""
-            count_match = re.search(r'総データ数: ([\d,]+)件', stdout)
-            chars_match = re.search(r'合計文字数: ([\d,]+)文字', stdout)
-            tokens_match = re.search(r'(?:推定)?トークン数: ([\d,]+)トークン', stdout)
-            is_estimated = "推定トークン数" in stdout
-
-            if count_match and chars_match and tokens_match:
-                st.markdown("##### 📊 生成データ統計")
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("📄 レコード数", count_match.group(1) + "件")
-                with col2:
-                    st.metric("📝 合計文字数", chars_match.group(1) + "字")
-                with col3:
-                    token_label = "🔢 推定トークン" if is_estimated else "🔢 トークン数"
-                    st.metric(token_label, tokens_match.group(1))
-
-            with st.expander("📋 実行ログ", expanded=False):
-                st.text(stdout)
-        else:
-            st.error("処理中にエラーが発生しました")
-            st.text(result.stderr or result.stdout)
+    if gen_button:
+        cmd_str = cmd_to_string(cmd)
+        st.subheader("実行コマンド")
+        st.code(cmd_str, language="bash")
+        st.info("💡 上記コマンドをターミナルにコピー＆ペーストして実行してください")
+        st.markdown("""
+**Tips:**
+- 途中で中断: `Ctrl+C`
+- 再開: `--resume` を追加して再実行
+""")
 
 # =============================================================================
 # Tab 2: 個別スクリプト
@@ -624,32 +605,7 @@ with tab2:
     st.markdown("##### 🖥️ 実行コマンド")
     st.code(" ".join(cmd2), language="bash")
 
-    # 実行ボタン
-    col1, col2, col3 = st.columns([1, 1, 1])
-    with col2:
-        run_script = st.button("🚀 スクリプト実行", key="run_script", type="primary", use_container_width=True)
-
-    if run_script:
-        with st.status("スクリプト実行中...", expanded=True) as status:
-            st.write(f"▶️ {selected_script} を実行中...")
-            env = os.environ.copy()
-            env["PYTHONIOENCODING"] = "utf-8"
-            result = subprocess.run(cmd2, capture_output=True, text=True, encoding="utf-8", env=env)
-
-            if result.returncode == 0:
-                status.update(label="✨ 実行完了!", state="complete", expanded=False)
-                st.toast("処理が完了しました!", icon="✅")
-            else:
-                status.update(label="❌ エラー発生", state="error")
-                st.toast("エラーが発生しました", icon="❌")
-
-        # ログ表示（statusブロックの外）
-        if result.returncode == 0:
-            with st.expander("📋 実行ログ", expanded=True):
-                st.text(result.stdout)
-        else:
-            st.error("処理中にエラーが発生しました")
-            st.text(result.stderr or result.stdout)
+    st.info("💡 上記コマンドをターミナルにコピー＆ペーストして実行してください")
 
 # =============================================================================
 # Tab 3: ビューアー

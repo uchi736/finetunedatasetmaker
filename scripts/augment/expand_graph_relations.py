@@ -18,8 +18,9 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from prompts import get_system_prompt, get_user_prompt
 
-# .envファイルを読み込み
-load_dotenv('config/.env')
+# .envファイルを読み込み（スクリプト位置基準の絶対パス）
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+load_dotenv(PROJECT_ROOT / 'config' / '.env')
 
 
 # 出力スキーマの定義

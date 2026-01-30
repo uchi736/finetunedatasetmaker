@@ -56,11 +56,12 @@ except LookupError:
 
 # Vision API (Azure OpenAI) のインポート
 try:
-    from openai import AzureOpenAI
+    from openai import AzureOpenAI, AsyncAzureOpenAI
     import PIL.Image
     import base64
 except ImportError:
     AzureOpenAI = None
+    AsyncAzureOpenAI = None
     PIL = None
     print("Warning: openai or Pillow not found. Vision features will be disabled.")
 
@@ -972,6 +973,7 @@ class DataAugmenter:
     """データ拡張機能を提供するクラス（Azure OpenAI使用）"""
     def __init__(self):
         self.client = None
+        self.async_client = None
         endpoint = os.getenv('AZURE_OPENAI_ENDPOINT')
         api_key = os.getenv('AZURE_OPENAI_API_KEY')
 
@@ -981,6 +983,13 @@ class DataAugmenter:
                     azure_endpoint=endpoint,
                     api_key=api_key,
                     api_version="2024-02-15-preview"
+                )
+                import httpx
+                self.async_client = AsyncAzureOpenAI(
+                    azure_endpoint=endpoint,
+                    api_key=api_key,
+                    api_version="2024-02-15-preview",
+                    timeout=httpx.Timeout(60.0, connect=10.0)
                 )
                 logger.info("DataAugmenter: Azure OpenAI model initialized.")
             except Exception as e:
@@ -1097,6 +1106,73 @@ class DataAugmenter:
             logger.warning(f"Discussion generation failed: {e}")
             return ""
 
+    # --- 非同期メソッド（並列処理用） ---
+
+    async def _call_llm_async(self, prompt: str) -> str:
+        """非同期LLM呼び出し"""
+        if not self.async_client:
+            return ""
+        response = await self.async_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2000
+        )
+        return response.choices[0].message.content.strip()
+
+    async def generate_paraphrase_async(self, text: str) -> str:
+        if not self.async_client or not text.strip():
+            return ""
+        prompt = get_user_prompt("paraphrase", text=text)
+        try:
+            return await self._call_llm_async(prompt)
+        except Exception as e:
+            logger.warning(f"Paraphrase generation failed: {e}")
+            return ""
+
+    async def generate_qa_async(self, context: str) -> Dict[str, str]:
+        if not self.async_client or not context.strip():
+            return {}
+        prompt = get_user_prompt("qa", context=context)
+        try:
+            response_text = await self._call_llm_async(prompt)
+            json_match = re.search(r'```json\s*({.*?})\s*```', response_text, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group(1))
+            return json.loads(response_text)
+        except Exception as e:
+            logger.warning(f"QA generation failed: {e}")
+            return {}
+
+    async def generate_summary_async(self, text: str, max_length: int = 150) -> str:
+        if not self.async_client or not text.strip():
+            return ""
+        prompt = get_user_prompt("summary", text=text, max_length=max_length)
+        try:
+            return await self._call_llm_async(prompt)
+        except Exception as e:
+            logger.warning(f"Summarization failed: {e}")
+            return ""
+
+    async def generate_discussion_async(self, text: str, turns: int = 3) -> str:
+        if not self.async_client or not text.strip():
+            return ""
+        prompt = get_user_prompt("discussion", text=text, turns=turns)
+        try:
+            return await self._call_llm_async(prompt)
+        except Exception as e:
+            logger.warning(f"Discussion generation failed: {e}")
+            return ""
+
+    async def generate_translation_async(self, text: str, lang: str = "英語") -> str:
+        if not self.async_client or not text.strip():
+            return ""
+        prompt = get_user_prompt("translation", text=text, lang=lang)
+        try:
+            return await self._call_llm_async(prompt)
+        except Exception as e:
+            logger.warning(f"Translation to {lang} failed: {e}")
+            return ""
+
 # --- 品質管理クラス ---
 class QualityController:
     """データの品質を管理するクラス"""
@@ -1195,8 +1271,9 @@ def main():
     """メイン処理"""
     import argparse
 
-    # config/.envから環境変数を読み込み
-    load_dotenv('config/.env')
+    # config/.envから環境変数を読み込み（スクリプト位置基準の絶対パス）
+    PROJECT_ROOT = Path(__file__).parent.parent.parent
+    load_dotenv(PROJECT_ROOT / 'config' / '.env')
 
     parser = argparse.ArgumentParser(
         description="統合報告書などの複雑なPDFを高精度でLLM学習用データに変換",

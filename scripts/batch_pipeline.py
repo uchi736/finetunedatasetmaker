@@ -14,21 +14,68 @@ PDFフォルダからLLM学習用データセットを一括生成するバッ�
 
 import json
 import argparse
+import asyncio
 import sys
+import shutil
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
 from tqdm import tqdm
 from dotenv import load_dotenv
 
-# config/.envから環境変数を読み込み
-load_dotenv('config/.env')
+# config/.envから環境変数を読み込み（スクリプト位置基準の絶対パス）
+PROJECT_ROOT = Path(__file__).parent.parent
+load_dotenv(PROJECT_ROOT / 'config' / '.env')
 
 # scriptsディレクトリをパスに追加
 sys.path.insert(0, str(Path(__file__).parent))
 
 from extract.datasetmaker import AdvancedPDFProcessor
 from preprocess.pack_sequences import pack_texts, estimate_tokens
+
+
+
+# --- チェックポイント機能 ---
+def _save_checkpoint(checkpoint_dir, stem, phase_name, results):
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    data_path = checkpoint_dir / f"{stem}_{phase_name}.jsonl"
+    with open(data_path, "w", encoding="utf-8") as f:
+        for r in results:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    state_path = checkpoint_dir / f"{stem}_state.json"
+    state = {}
+    if state_path.exists():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    completed = state.get("completed_phases", [])
+    if phase_name not in completed:
+        completed.append(phase_name)
+    state["completed_phases"] = completed
+    state["results_count"] = len(results)
+    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"  checkpoint: {phase_name} ({len(results)}件)")
+    sys.stdout.flush()
+
+
+def _load_checkpoint(checkpoint_dir, stem):
+    state_path = checkpoint_dir / f"{stem}_state.json"
+    if not state_path.exists():
+        return [], []
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    completed = state.get("completed_phases", [])
+    if not completed:
+        return [], []
+    latest_phase = completed[-1]
+    data_path = checkpoint_dir / f"{stem}_{latest_phase}.jsonl"
+    if not data_path.exists():
+        return completed, []
+    results = []
+    with open(data_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                results.append(json.loads(line))
+    print(f"  checkpoint復元: {latest_phase} ({len(results)}件)")
+    sys.stdout.flush()
+    return completed, results
 
 
 def process_single_pdf(
@@ -114,44 +161,85 @@ def process_single_pdf(
             except Exception as e:
                 print(f"  ⚠️ 警告: 辞書読み込み失敗: {e}")
 
-        for chunk in tqdm(chunks, desc="  データ拡張", unit="件"):
-            # オリジナル
-            results.append({"text": chunk.text})
+        # --- LLMベース拡張（非同期バッチ処理） ---
+        has_llm_augment = augment and augmenter and augmenter.async_client and any([
+            aug_options.get("paraphrase"), aug_options.get("qa"),
+            aug_options.get("summary"), aug_options.get("discussion"),
+        ])
 
-            # LLMベース拡張
-            if augment and augmenter and augmenter.client:
-                if aug_options.get("paraphrase"):
-                    paraphrase = augmenter.generate_paraphrase(chunk.text)
-                    if paraphrase:
-                        results.append({"text": paraphrase})
+        if has_llm_augment:
+            # セマフォで同時リクエスト数を制限（レートリミット対策）
+            MAX_CONCURRENT = 3
 
-                if aug_options.get("qa"):
-                    qa = augmenter.generate_qa(chunk.text)
-                    if qa and qa.get("question") and qa.get("answer"):
-                        qa_text = f"質問: {qa['question']}\n回答: {qa['answer']}"
-                        results.append({"text": qa_text})
+            async def _process_all_chunks(chunks, augmenter, aug_options):
+                """全チャンクをセマフォで同時実行数制限しつつ並列処理"""
+                sem = asyncio.Semaphore(MAX_CONCURRENT)
+                all_results = [None] * len(chunks)
+                completed = [0]
 
-                if aug_options.get("summary"):
-                    summary = augmenter.generate_summary(chunk.text)
-                    if summary:
-                        results.append({"text": summary})
+                async def _process_one(idx, chunk_text):
+                    async with sem:
+                        tasks = []
+                        labels = []
+                        if aug_options.get("paraphrase"):
+                            tasks.append(augmenter.generate_paraphrase_async(chunk_text))
+                            labels.append("paraphrase")
+                        if aug_options.get("qa"):
+                            tasks.append(augmenter.generate_qa_async(chunk_text))
+                            labels.append("qa")
+                        if aug_options.get("summary"):
+                            tasks.append(augmenter.generate_summary_async(chunk_text))
+                            labels.append("summary")
+                        if aug_options.get("discussion"):
+                            tasks.append(augmenter.generate_discussion_async(chunk_text))
+                            labels.append("discussion")
+                        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                # 議論形式
-                if aug_options.get("discussion"):
-                    discussion = augmenter.generate_discussion(chunk.text)
-                    if discussion:
-                        results.append({"text": discussion})
+                        chunk_results = []
+                        chunk_results.append({"text": chunk_text})  # オリジナル
+                        for label, result in zip(labels, results):
+                            if isinstance(result, Exception):
+                                print(f"  ⚠️ {label} 失敗: {result}")
+                                continue
+                            if label == "qa" and isinstance(result, dict):
+                                if result.get("question") and result.get("answer"):
+                                    chunk_results.append({"text": f"質問: {result['question']}\n回答: {result['answer']}"})
+                            elif label in ("paraphrase", "summary", "discussion") and result:
+                                chunk_results.append({"text": result})
 
-            # 辞書ベース拡張（LLM不要）
-            if augment and term_dict:
-                # 一般化
+                        all_results[idx] = chunk_results
+                        completed[0] += 1
+                        print(f"  完了: {completed[0]}/{len(chunks)}件")
+                        sys.stdout.flush()
+
+                await asyncio.gather(*[
+                    _process_one(i, c.text) for i, c in enumerate(chunks)
+                ])
+                # 順序を維持して展開
+                flat = []
+                for r in all_results:
+                    if r:
+                        flat.extend(r)
+                return flat
+
+            print(f"  LLM拡張（非同期処理、最大同時{MAX_CONCURRENT}リクエスト）...")
+            sys.stdout.flush()
+            llm_results = asyncio.run(_process_all_chunks(chunks, augmenter, aug_options))
+            results.extend(llm_results)
+        else:
+            # LLM拡張なし or フォールバック：オリジナルのみ追加
+            for chunk in chunks:
+                results.append({"text": chunk.text})
+
+        # --- 辞書ベース拡張（LLM不要） ---
+        if augment and term_dict:
+            for chunk in tqdm(chunks, desc="  辞書ベース拡張", unit="件"):
                 if aug_options.get("generalized"):
                     from augment.expand_generalized import generalize_text
                     gen_result = generalize_text(chunk.text, term_dict)
                     if gen_result and gen_result.get("text") != chunk.text and gen_result.get("replacements"):
                         results.append({"text": gen_result["text"]})
 
-                # キーワード抽出
                 if aug_options.get("keywords"):
                     from augment.expand_keywords import extract_keywords, generate_keywords_text
                     kw_result = extract_keywords(chunk.text, term_dict)
@@ -174,7 +262,6 @@ def process_single_pdf(
         # グラフ関係性（async処理）
         if augment and aug_options.get("graph"):
             try:
-                import asyncio
                 from augment.expand_graph_relations import process as graph_process
                 graph_file = aug_options.get("graph_file", "data/graph/graph.json")
                 graph_results = asyncio.run(graph_process(graph_file))
@@ -187,7 +274,6 @@ def process_single_pdf(
         # 英語翻訳（async処理）
         if augment and aug_options.get("translation_en"):
             try:
-                import asyncio
                 from augment.expand_to_english import process as translate_en
                 data = [{"text": chunk.text} for chunk in chunks]
                 translated = asyncio.run(translate_en(data))
@@ -197,19 +283,23 @@ def process_single_pdf(
             except Exception as e:
                 print(f"  ⚠️ 警告: 英語翻訳失敗: {e}")
 
-        # 中国語翻訳（LLM使用）
-        if augment and aug_options.get("translation_zh") and augmenter and augmenter.client:
-            translated_count = 0
-            for chunk in chunks:
-                try:
-                    translated = augmenter.generate_translation(chunk.text, "中国語")
-                    if translated:
-                        results.append({"text": translated})
-                        translated_count += 1
-                except Exception as e:
-                    print(f"  ⚠️ 警告: 中国語翻訳失敗: {e}")
-            if translated_count > 0:
-                print(f"  中国語翻訳追加: {translated_count}件")
+        # 中国語翻訳（非同期バッチ処理）
+        if augment and aug_options.get("translation_zh") and augmenter and augmenter.async_client:
+            try:
+                async def _translate_zh_batch(chunks, augmenter, batch_size=10):
+                    translated = []
+                    for i in range(0, len(chunks), batch_size):
+                        batch = chunks[i:i+batch_size]
+                        tasks = [augmenter.generate_translation_async(c.text, "中国語") for c in batch]
+                        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                        translated.extend([r for r in batch_results if isinstance(r, str) and r])
+                    return translated
+                zh_results = asyncio.run(_translate_zh_batch(chunks, augmenter))
+                for text in zh_results:
+                    results.append({"text": text})
+                print(f"  中国語翻訳追加: {len(zh_results)}件")
+            except Exception as e:
+                print(f"  ⚠️ 警告: 中国語翻訳失敗: {e}")
 
         print(f"  拡張後データ数: {len(results)}")
 
@@ -231,7 +321,8 @@ def process_jsonl_input(
     jsonl_path: Path,
     output_dir: Path,
     augment: bool,
-    aug_options: dict
+    aug_options: dict,
+    resume: bool = False
 ) -> Optional[Path]:
     """
     JSONLファイルを読み込み、データ拡張を適用して出力
@@ -264,6 +355,16 @@ def process_jsonl_input(
         # データ拡張（オプション）
         results = []
 
+        # チェックポイント
+        stem = jsonl_path.stem
+        checkpoint_dir = output_dir / ".checkpoint"
+        completed_phases = []
+
+        if resume:
+            completed_phases, results = _load_checkpoint(checkpoint_dir, stem)
+            if completed_phases:
+                print(f"  再開: 完了済みフェーズ = {completed_phases}")
+
         # LLMベース拡張の準備
         augmenter = None
         llm_augment_enabled = any([
@@ -291,35 +392,76 @@ def process_jsonl_input(
             except Exception as e:
                 print(f"  ⚠️ 警告: 辞書読み込み失敗: {e}")
 
-        for text in tqdm(texts, desc="  データ拡張", unit="件"):
-            # オリジナル
-            results.append({"text": text})
+        # --- LLMベース拡張（非同期バッチ処理） ---
+        has_llm_augment = augment and augmenter and augmenter.async_client and any([
+            aug_options.get("paraphrase"), aug_options.get("qa"),
+            aug_options.get("summary"), aug_options.get("discussion"),
+        ])
 
-            # LLMベース拡張
-            if augment and augmenter and augmenter.client:
-                if aug_options.get("paraphrase"):
-                    paraphrase = augmenter.generate_paraphrase(text)
-                    if paraphrase:
-                        results.append({"text": paraphrase})
+        if has_llm_augment and "llm_augment" not in completed_phases:
+            MAX_CONCURRENT = 3
 
-                if aug_options.get("qa"):
-                    qa = augmenter.generate_qa(text)
-                    if qa and qa.get("question") and qa.get("answer"):
-                        qa_text = f"質問: {qa['question']}\n回答: {qa['answer']}"
-                        results.append({"text": qa_text})
+            async def _process_all_texts(texts, augmenter, aug_options):
+                sem = asyncio.Semaphore(MAX_CONCURRENT)
+                all_results = [None] * len(texts)
+                completed = [0]
 
-                if aug_options.get("summary"):
-                    summary = augmenter.generate_summary(text)
-                    if summary:
-                        results.append({"text": summary})
+                async def _process_one(idx, text):
+                    async with sem:
+                        tasks = []
+                        labels = []
+                        if aug_options.get("paraphrase"):
+                            tasks.append(augmenter.generate_paraphrase_async(text))
+                            labels.append("paraphrase")
+                        if aug_options.get("qa"):
+                            tasks.append(augmenter.generate_qa_async(text))
+                            labels.append("qa")
+                        if aug_options.get("summary"):
+                            tasks.append(augmenter.generate_summary_async(text))
+                            labels.append("summary")
+                        if aug_options.get("discussion"):
+                            tasks.append(augmenter.generate_discussion_async(text))
+                            labels.append("discussion")
+                        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                if aug_options.get("discussion"):
-                    discussion = augmenter.generate_discussion(text)
-                    if discussion:
-                        results.append({"text": discussion})
+                        text_results = []
+                        text_results.append({"text": text})
+                        for label, result in zip(labels, results):
+                            if isinstance(result, Exception):
+                                print(f"  ⚠️ {label} 失敗: {result}")
+                                continue
+                            if label == "qa" and isinstance(result, dict):
+                                if result.get("question") and result.get("answer"):
+                                    text_results.append({"text": f"質問: {result['question']}\n回答: {result['answer']}"})
+                            elif label in ("paraphrase", "summary", "discussion") and result:
+                                text_results.append({"text": result})
 
-            # 辞書ベース拡張（LLM不要）
-            if augment and term_dict:
+                        all_results[idx] = text_results
+                        completed[0] += 1
+                        print(f"  完了: {completed[0]}/{len(texts)}件")
+                        sys.stdout.flush()
+
+                await asyncio.gather(*[
+                    _process_one(i, t) for i, t in enumerate(texts)
+                ])
+                flat = []
+                for r in all_results:
+                    if r:
+                        flat.extend(r)
+                return flat
+
+            print(f"  LLM拡張（非同期処理、最大同時{MAX_CONCURRENT}リクエスト）...")
+            sys.stdout.flush()
+            llm_results = asyncio.run(_process_all_texts(texts, augmenter, aug_options))
+            results.extend(llm_results)
+            _save_checkpoint(checkpoint_dir, stem, "llm_augment", results)
+        elif "llm_augment" not in completed_phases:
+            for text in texts:
+                results.append({"text": text})
+
+        # --- 辞書ベース拡張（LLM不要） ---
+        if augment and term_dict and "dict_augment" not in completed_phases:
+            for text in tqdm(texts, desc="  辞書ベース拡張", unit="件"):
                 if aug_options.get("generalized"):
                     from augment.expand_generalized import generalize_text
                     gen_result = generalize_text(text, term_dict)
@@ -333,9 +475,10 @@ def process_jsonl_input(
                         kw_text = generate_keywords_text(kw_result["keywords"])
                         if kw_text:
                             results.append({"text": kw_text})
+            _save_checkpoint(checkpoint_dir, stem, "dict_augment", results)
 
         # 辞書定義（テキストとは別に辞書全体から生成）
-        if augment and aug_options.get("dictionary"):
+        if augment and aug_options.get("dictionary") and "dictionary" not in completed_phases:
             try:
                 from augment.expand_dictionary import process as dict_process
                 dict_results = dict_process(dict_file)
@@ -346,9 +489,8 @@ def process_jsonl_input(
                 print(f"  ⚠️ 警告: 辞書定義生成失敗: {e}")
 
         # グラフ関係性（async処理）
-        if augment and aug_options.get("graph"):
+        if augment and aug_options.get("graph") and "graph" not in completed_phases:
             try:
-                import asyncio
                 from augment.expand_graph_relations import process as graph_process
                 graph_file = aug_options.get("graph_file", "data/graph/graph.json")
                 graph_results = asyncio.run(graph_process(graph_file))
@@ -359,31 +501,36 @@ def process_jsonl_input(
                 print(f"  ⚠️ 警告: グラフ関係性生成失敗: {e}")
 
         # 英語翻訳（async処理）
-        if augment and aug_options.get("translation_en"):
+        if augment and aug_options.get("translation_en") and "translation_en" not in completed_phases:
             try:
-                import asyncio
                 from augment.expand_to_english import process as translate_en
                 data = [{"text": t} for t in texts]
                 translated = asyncio.run(translate_en(data))
                 for item in translated:
                     results.append({"text": item["text"]})
                 print(f"  英語翻訳追加: {len(translated)}件")
+                _save_checkpoint(checkpoint_dir, stem, "translation_en", results)
             except Exception as e:
                 print(f"  ⚠️ 警告: 英語翻訳失敗: {e}")
 
-        # 中国語翻訳（LLM使用）
-        if augment and aug_options.get("translation_zh") and augmenter and augmenter.client:
-            translated_count = 0
-            for text in texts:
-                try:
-                    translated = augmenter.generate_translation(text, "中国語")
-                    if translated:
-                        results.append({"text": translated})
-                        translated_count += 1
-                except Exception as e:
-                    print(f"  ⚠️ 警告: 中国語翻訳失敗: {e}")
-            if translated_count > 0:
-                print(f"  中国語翻訳追加: {translated_count}件")
+        # 中国語翻訳（非同期バッチ処理）
+        if augment and aug_options.get("translation_zh") and augmenter and augmenter.async_client and "translation_zh" not in completed_phases:
+            try:
+                async def _translate_zh_texts(texts, augmenter, batch_size=10):
+                    translated = []
+                    for i in range(0, len(texts), batch_size):
+                        batch = texts[i:i+batch_size]
+                        tasks = [augmenter.generate_translation_async(t, "中国語") for t in batch]
+                        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                        translated.extend([r for r in batch_results if isinstance(r, str) and r])
+                    return translated
+                zh_results = asyncio.run(_translate_zh_texts(texts, augmenter))
+                for text in zh_results:
+                    results.append({"text": text})
+                print(f"  中国語翻訳追加: {len(zh_results)}件")
+                _save_checkpoint(checkpoint_dir, stem, "translation_zh", results)
+            except Exception as e:
+                print(f"  ⚠️ 警告: 中国語翻訳失敗: {e}")
 
         print(f"  拡張後データ数: {len(results)}")
 
@@ -548,6 +695,7 @@ def main():
     parser.add_argument("--no-shuffle", action="store_true", help="最終マージ時にシャッフルしない")
     parser.add_argument("--keep-intermediate", action="store_true", help="中間ファイルを保持")
     parser.add_argument("--tokenizer", help="トークナイザーのモデル名（例: llm-jp/llm-jp-3-13b）")
+    parser.add_argument("--resume", action="store_true", help="チェックポイントから再開")
 
     args = parser.parse_args()
 
@@ -583,6 +731,8 @@ def main():
         print(f"# 入力ファイル: {input_path}")
         print(f"# 出力先: {output_path}")
         print(f"# データ拡張: {'有効' if args.augment else '無効'}")
+        if args.resume:
+            print(f"# チェックポイントから再開: 有効")
         print(f"{'#'*60}")
 
         if args.augment:
@@ -592,7 +742,8 @@ def main():
                 jsonl_path=input_path,
                 output_dir=output_dir,
                 augment=True,
-                aug_options=aug_options
+                aug_options=aug_options,
+                resume=args.resume
             )
             if result:
                 processed_files = [result]
@@ -621,6 +772,13 @@ def main():
         print(f"\n[Phase 1] PDF処理")
         processed_files = []
         for pdf_path in tqdm(pdf_files, desc="PDF処理進捗", unit="ファイル"):
+            # --resume: 既に出力ファイルがあればスキップ
+            pdf_output = output_dir / f"{pdf_path.stem}.jsonl"
+            if args.resume and pdf_output.exists():
+                print(f"\n  スキップ（処理済み）: {pdf_path.name}")
+                processed_files.append(pdf_output)
+                continue
+
             result = process_single_pdf(
                 pdf_path=pdf_path,
                 output_dir=output_dir,
@@ -674,6 +832,12 @@ def main():
             for f in packed_files:
                 if f.exists() and f != output_path:
                     f.unlink()
+
+    # チェックポイント削除（正常完了時）
+    checkpoint_dir = output_dir / ".checkpoint"
+    if checkpoint_dir.exists() and not args.keep_intermediate:
+        shutil.rmtree(checkpoint_dir)
+        print("  チェックポイント削除完了")
 
     # 完了
     token_label = "トークン数" if not stats['is_estimated'] else "推定トークン数"
