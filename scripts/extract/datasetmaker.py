@@ -499,7 +499,7 @@ class AdvancedPDFProcessor:
 簡潔かつ正確に説明してください。"""
 
             response = self.vision_client.chat.completions.create(
-                model="gpt-4.1-mini",
+                model=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME", "gpt-4.1-mini"),
                 messages=[
                     {
                         "role": "user",
@@ -566,7 +566,7 @@ HTML表:
 説明文:"""
 
         response = self.vision_client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME", "gpt-4.1-mini"),
             messages=[{"role": "user", "content": prompt}],
             max_tokens=1500
         )
@@ -786,7 +786,7 @@ HTML表:
             prompt = get_user_prompt("image_description")
 
             response = self.vision_client.chat.completions.create(
-                model="gpt-4.1-mini",
+                model=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME", "gpt-4.1-mini"),
                 messages=[
                     {
                         "role": "user",
@@ -1000,7 +1000,7 @@ class DataAugmenter:
         if not self.client:
             return ""
         response = self.client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME", "gpt-4.1-mini"),
             messages=[{"role": "user", "content": prompt}],
             max_tokens=2000
         )
@@ -1113,7 +1113,7 @@ class DataAugmenter:
         if not self.async_client:
             return ""
         response = await self.async_client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME", "gpt-4.1-mini"),
             messages=[{"role": "user", "content": prompt}],
             max_tokens=2000
         )

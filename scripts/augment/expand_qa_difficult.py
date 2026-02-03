@@ -38,8 +38,9 @@ os.environ['AZURE_OPENAI_ENDPOINT'] = os.getenv('AZURE_OPENAI_ENDPOINT')
 os.environ['AZURE_OPENAI_API_KEY'] = os.getenv('AZURE_OPENAI_API_KEY')
 os.environ['OPENAI_API_VERSION'] = os.getenv('AZURE_OPENAI_API_VERSION', '2024-12-01-preview')
 
+_model_name = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME", "gpt-4.1-mini")
 agent = Agent(
-    "azure:gpt-4.1-mini",
+    f"azure:{_model_name}",
     output_type=QAOutput,
     system_prompt=get_system_prompt("qa_difficult"),
 )

@@ -251,7 +251,7 @@ def process_single_pdf(
         # 辞書定義（チャンクとは別に辞書全体から生成）
         if augment and aug_options.get("dictionary"):
             try:
-                from augment.expand_dictionary import process as dict_process
+                from augment.expand_from_dict import process as dict_process
                 dict_results = dict_process(dict_file)
                 for item in dict_results:
                     results.append({"text": item["text"]})
@@ -480,7 +480,7 @@ def process_jsonl_input(
         # 辞書定義（テキストとは別に辞書全体から生成）
         if augment and aug_options.get("dictionary") and "dictionary" not in completed_phases:
             try:
-                from augment.expand_dictionary import process as dict_process
+                from augment.expand_from_dict import process as dict_process
                 dict_results = dict_process(dict_file)
                 for item in dict_results:
                     results.append({"text": item["text"]})
